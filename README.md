@@ -20,7 +20,7 @@ Egy kis parancssori eszköz, amely **megnézi és megméri egy zenerész hanger�
 ## Gyors kezdés (Windows)
 
 1. Kell a Node.js (18+): parancssorban `node --version`.
-2. Telepítés és első próba: [docs/TELEPITES.md](docs/TELEPITES.md) (kb. 10 perc).
+2. Telepítés: dupla kattintás a `telepites.bat`-ra, utána az Ableton beállítása és `ellenorzes.bat` ([docs/TELEPITES.md](docs/TELEPITES.md), kb. 10 perc).
 3. Használat:
    ```bash
    hangero ellenoriz

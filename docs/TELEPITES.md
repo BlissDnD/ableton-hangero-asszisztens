@@ -74,3 +74,8 @@ Az élő próba lépései: [TESZT-UTMUTATO.md](TESZT-UTMUTATO.md). Használat é
 ## Eltávolítás
 
 Töröld a `<User Library>\Remote Scripts\AbletonMCP` mappát, és vedd ki a Control Surface listából. Mást nem telepít az eszköz. Mérés után maradhat WAV a projekt `Samples\Recorded` mappájában: ezeket kézzel törölheted.
+
+## Gyorsított út (dupla kattintás)
+1. `telepites.bat` – ellenőrzi a Node.js-t, és bemásolja a Remote Scriptet.
+2. Live újraindítás, Control Surface: **AbletonMCP** (lásd 3. lépés).
+3. `ellenorzes.bat` – kiírja a kapcsolat és a Live-verzió állapotát.
