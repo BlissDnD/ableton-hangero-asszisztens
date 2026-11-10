@@ -1,0 +1,5 @@
+node_modules/
+jelentesek/*
+!jelentesek/.gitkeep
+*.zip
+.hangero-asszisztens/

@@ -1,0 +1,827 @@
+"""Curated get/set for Live object properties (Song, Track, Scene, ClipSlot, Clip).
+
+Live's Boost.Python setters take exact C++ types, raise multi-line ArgumentErrors and enforce ordering between
+properties (loop end before loop start...). This layer validates and coerces first (strict bool/int/float/str, enums
+by name, never raw ints from the caller), applies writes in as many passes as needed so dependent properties order
+themselves, and reads every value back. It is a curated table now; a generated registry replaces it later.
+"""
+import re
+
+import Live
+
+from . import api_registry
+from . import device_addressing
+from . import device_specific
+from .helpers import _is_number, _safe_attr
+from .registry import BridgeError, command
+
+
+def _spec(type_, rw=True, enum=None, doc="", lo=None, hi=None, get=None, set=None, ref=None, coerce=None):
+    """coerce(obj, value) replaces the standard value checks when a property's valid values depend on the object itself."""
+    return {"type": type_, "rw": rw, "enum": enum, "doc": doc, "min": lo, "max": hi, "get": get, "set": set, "ref": ref,
+            "coerce": coerce}
+
+
+def _volume_get(track):
+    return track.mixer_device.volume.value
+
+
+def _volume_set(track, value):
+    track.mixer_device.volume.value = value
+
+
+def _pan_get(track):
+    return track.mixer_device.panning.value
+
+
+def _pan_set(track, value):
+    track.mixer_device.panning.value = value
+
+
+def _warp_markers_get(clip):
+    return [{"beat_time": m.beat_time, "sample_time": m.sample_time} for m in clip.warp_markers]
+
+
+def _mixer_get(name):
+    return lambda track: getattr(track.mixer_device, name)
+
+
+def _mixer_set(name):
+    return lambda track, value: setattr(track.mixer_device, name, value)
+
+
+def _mixer_value_get(name):
+    """Value of a mixer parameter (the master's crossfader and cue volume); other tracks have none, so reading raises."""
+    return lambda track: getattr(track.mixer_device, name).value
+
+
+def _mixer_value_set(name):
+    return lambda track, value: setattr(getattr(track.mixer_device, name), "value", value)
+
+
+def _device_on_parameter(device):
+    parameters = list(device.parameters)
+    for parameter in parameters:
+        if parameter.name == "Device On":
+            return parameter
+    raise RuntimeError("'{0}' has no on/off switch".format(device.name))
+
+
+def _device_on_get(device):
+    return _device_on_parameter(device).value > 0.5
+
+
+def _device_on_set(device, value):
+    _device_on_parameter(device).value = 1.0 if value else 0.0
+
+
+def _collapsed_get(device):
+    return device.view.is_collapsed
+
+
+def _collapsed_set(device, value):
+    device.view.is_collapsed = value
+
+
+def _display_get(parameter):
+    return parameter.str_for_value(parameter.value)
+
+
+def _value_items_get(parameter):
+    return list(parameter.value_items)
+
+
+def _parameter_value(parameter, value):
+    """A parameter's value: a number inside its range, or for a quantized parameter the label Live shows for it."""
+    if not parameter.is_enabled:
+        raise BridgeError("Parameter '{0}' is not enabled (macro-mapped or switched off by another parameter)".format(parameter.name), "UNAVAILABLE")
+    if isinstance(value, str):
+        if not parameter.is_quantized:
+            raise BridgeError("value must be a number: '{0}' is not a quantized parameter".format(parameter.name), "TYPE_ERROR")
+        items = list(parameter.value_items)
+        if value not in items:
+            raise BridgeError("value must be one of: {0}".format(", ".join(items)), "INVALID_ARGUMENT")
+        return float(parameter.min + items.index(value))
+    if not _is_number(value):
+        raise BridgeError("value must be a number" + (" or a label" if parameter.is_quantized else ""), "TYPE_ERROR")
+    value = float(value)
+    if value < parameter.min or value > parameter.max:
+        raise BridgeError("value {0:g} is outside this parameter's range {1:g} to {2:g}".format(value, parameter.min, parameter.max), "OUT_OF_RANGE")
+    return value
+
+
+_DISPLAY_NUMBER = re.compile(r"^\s*([-+]?(?:\d+\.?\d*|\.\d+))\s*([A-Za-z%°µ]*)")
+_UNIT_SCALE = {"khz": ("hz", 1000.0), "hz": ("hz", 1.0), "ms": ("s", 0.001), "s": ("s", 1.0)}
+
+
+def _display_number(text):
+    """(number, unit) of a value as Live displays it, in base units: '1.50 kHz' is (1500.0, 'hz'), '129 ms' is (0.129, 's'),
+    '-26.1 dB' is (-26.1, 'db'), '3.99 : 1' is (3.99, ''), '-inf dB' is (-inf, 'db'). None when it has no leading number."""
+    text = str(text).strip()
+    lowered = text.lower().replace("- inf", "-inf").replace("+inf", "inf")
+    for prefix, infinity in (("-inf", float("-inf")), ("inf", float("inf"))):        # a Compressor ratio ends at 'inf : 1', a fader at '-inf dB'
+        if lowered.startswith(prefix):
+            unit = re.match(r"[a-z%]*", lowered[len(prefix):].strip()).group(0)
+            return infinity, _UNIT_SCALE.get(unit, (unit, 1.0))[0]
+    match = _DISPLAY_NUMBER.match(text)
+    if match is None:
+        return None
+    unit, scale = _UNIT_SCALE.get(match.group(2).lower(), (match.group(2).lower(), 1.0))
+    return float(match.group(1)) * scale, unit
+
+
+def _display_precision(text):
+    """Half a display step of the leading number of `text`, in base units: the precision the caller asked for
+    ('35 Hz' is 0.5, '-26.1 dB' is 0.05, '129 ms' is 0.0005 s)."""
+    match = _DISPLAY_NUMBER.match(str(text))
+    if match is None:
+        return 0.0
+    decimals = len(match.group(1).split(".")[1]) if "." in match.group(1) else 0
+    return 0.5 * (10.0 ** -decimals) * _UNIT_SCALE.get(match.group(2).lower(), (None, 1.0))[1]
+
+
+def _display_of(parameter, raw):
+    try:
+        return parameter.str_for_value(raw)
+    except Exception:
+        return None
+
+
+def _parameter_display(parameter, text):
+    """Turn a displayed value ('35 Hz', '-26 dB', '129 ms', 'Low pass') into the raw value that makes Live show it.
+
+    A quantized parameter takes its label. For the others the display is searched by bisection (Live gives no inverse of
+    str_for_value). The nearest displayable value wins; a value the display cannot reach, or a text in another unit, is
+    refused with what the parameter does show, never silently rounded to something else."""
+    if not parameter.is_enabled:
+        raise BridgeError("Parameter '{0}' is not enabled (macro-mapped or switched off by another parameter)".format(parameter.name), "UNAVAILABLE")
+    if not isinstance(text, str) or not text.strip():
+        raise BridgeError("display must be the value as Live shows it, for example '35 Hz'", "TYPE_ERROR")
+    if parameter.is_quantized:
+        items = list(parameter.value_items)
+        for index, item in enumerate(items):
+            if item.strip().lower() == text.strip().lower():
+                return float(parameter.min + index)
+        raise BridgeError("display must be one of: {0}".format(", ".join(items)), "INVALID_ARGUMENT")
+    wanted = _display_number(text)
+    if wanted is None:
+        raise BridgeError("display '{0}' has no number: write it the way Live shows it, for example '35 Hz'".format(text), "INVALID_ARGUMENT")
+    target, unit = wanted
+    low, high = float(parameter.min), float(parameter.max)
+    shown_low, shown_high = _display_of(parameter, low), _display_of(parameter, high)
+    number_low, number_high = _display_number(shown_low or ""), _display_number(shown_high or "")
+    if number_low is None or number_high is None:
+        raise BridgeError("'{0}' has no numeric display ('{1}' to '{2}'): set its value instead".format(parameter.name, shown_low, shown_high), "INVALID_ARGUMENT")
+    range_unit = number_high[1] or number_low[1]
+    if unit and range_unit and unit != range_unit:
+        raise BridgeError("'{0}' shows {1} ('{2}' to '{3}'): '{4}' is in another unit".format(
+            parameter.name, {"hz": "Hz", "s": "time", "db": "dB"}.get(range_unit, range_unit), shown_low, shown_high, text), "INVALID_ARGUMENT")
+    ends = (number_low[0], number_high[0])
+    if ends[0] == ends[1]:
+        raise BridgeError("'{0}' shows the same value ('{1}') at both ends of its range".format(parameter.name, shown_low), "INVALID_ARGUMENT")
+    rising = ends[1] > ends[0]
+    if not min(ends) <= target <= max(ends):
+        raise BridgeError("{0} is outside what '{1}' can show: '{2}' to '{3}'".format(text, parameter.name, shown_low, shown_high), "OUT_OF_RANGE")
+
+    def shown(raw):
+        parsed = _display_number(_display_of(parameter, raw) or "")
+        return None if parsed is None else parsed[0]
+
+    for _ in range(64):
+        middle = (low + high) / 2.0
+        current = shown(middle)
+        if current is None:
+            break
+        if (current < target) == rising:
+            low = middle
+        else:
+            high = middle
+    scored = [(abs(shown(raw) - target), raw) for raw in (low, (low + high) / 2.0, high) if shown(raw) is not None]
+    if not scored:
+        raise BridgeError("could not read the display of '{0}'".format(parameter.name), "LIVE_ERROR")
+    distance, raw = min(scored)
+    # The precision the caller wrote decides what counts as a match: '35 Hz' accepts 34.6, '3.99' needs two decimals right.
+    if target != float("-inf") and distance > _display_precision(text) + 1e-9:
+        raise BridgeError("'{0}' cannot show {1}: the nearest it shows is '{2}'".format(parameter.name, text, _display_of(parameter, raw)), "OUT_OF_RANGE",
+                          {"nearest": _display_of(parameter, raw), "value": raw})
+    return raw
+
+
+def _display_set(parameter, raw):
+    parameter.value = raw
+
+
+# ---- views: what Live's window shows (selection, the Detail view, grids). UI state, not part of the Set, so never hashed.
+
+DOCUMENT_VIEWS = ("Session", "Arranger")
+
+
+def _selected_device_get(view):
+    """The device selected in the selected track's device chain (Live has no getter on the Song's view)."""
+    return view.selected_track.view.selected_device
+
+
+def _selected_device_set(view, device):
+    view.select_device(device)
+
+
+def _document_view(_view, value):
+    if value not in DOCUMENT_VIEWS:
+        raise BridgeError("focused_document_view must be one of: {0}".format(", ".join(DOCUMENT_VIEWS)), "INVALID_ARGUMENT")
+    return value
+
+
+def _focus_document_view(view, value):
+    view.focus_view(value)
+
+
+def _available_views(view):
+    return [str(name) for name in view.available_main_views()]
+
+
+def _visible_views(view):
+    return [name for name in _available_views(view) if view.is_view_visible(name)]
+
+
+RO = False
+
+PROPERTY_SPECS = {
+    "song": {
+        "tempo": _spec("float", doc="BPM", lo=20.0, hi=999.0),
+        "signature_numerator": _spec("int", lo=1, hi=99),
+        "signature_denominator": _spec("int", doc="1, 2, 4, 8 or 16"),
+        "metronome": _spec("bool"),
+        "loop": _spec("bool", doc="Arrangement loop on/off"),
+        "loop_start": _spec("float", doc="beats"),
+        "loop_length": _spec("float", doc="beats"),
+        "punch_in": _spec("bool"),
+        "punch_out": _spec("bool"),
+        "start_time": _spec("float", doc="Arrangement play start, beats"),
+        "current_song_time": _spec("float", doc="Playhead, beats"),
+        "groove_amount": _spec("float", doc="Global groove amount, 0 to 1.3", lo=0.0, hi=1.3),
+        "swing_amount": _spec("float", lo=0.0, hi=1.0),
+        "clip_trigger_quantization": _spec("enum", enum="Live.Song.Quantization", doc="Global launch quantization"),
+        "midi_recording_quantization": _spec("enum", enum="Live.Song.RecordingQuantization"),
+        "root_note": _spec("int", doc="Scale root, 0 (C) to 11 (B)", lo=0, hi=11),
+        "scale_name": _spec("str"),
+        "scale_mode": _spec("bool", doc="Scale awareness on/off"),
+        "scale_intervals": _spec("list", RO),
+        "arrangement_overdub": _spec("bool"),
+        "back_to_arranger": _spec("bool"),
+        "is_playing": _spec("bool", RO, doc="Use transport actions to start/stop"),
+        "song_length": _spec("float", RO),
+        "can_undo": _spec("bool", RO),
+        "can_redo": _spec("bool", RO),
+        "can_capture_midi": _spec("bool", RO),
+        "count_in_duration": _spec("int", RO, doc="0 none, 1 = 1 bar, 2 = 2 bars, 3 = 4 bars"),
+        "exclusive_arm": _spec("bool", RO),
+        "exclusive_solo": _spec("bool", RO),
+        "select_on_launch": _spec("bool", RO),
+        "name": _spec("str", RO),
+        "file_path": _spec("str", RO),
+        "is_counting_in": _spec("bool", RO),
+        "can_jump_to_next_cue": _spec("bool", RO),
+        "can_jump_to_prev_cue": _spec("bool", RO),
+        "last_event_time": _spec("float", RO, doc="End of the last clip or automation event, beats"),
+        "session_record_status": _spec("enum", RO, enum="Live.Song.SessionRecordStatus"),
+        "record_mode": _spec("bool", RO, doc="Arrangement recording: read here, started through the gated record tools"),
+        "overdub": _spec("bool", RO),
+        "session_record": _spec("bool", RO),
+        "session_automation_record": _spec("bool", RO),
+        "re_enable_automation_enabled": _spec("bool", RO, doc="True when some automation was overridden and can be re-enabled"),
+        "is_ableton_link_enabled": _spec("bool", RO, doc="Link is a network feature: changing it is left to the user"),
+        "is_ableton_link_start_stop_sync_enabled": _spec("bool", RO),
+        "tempo_follower_enabled": _spec("bool", RO),
+    },
+    "track": {
+        "name": _spec("str"),
+        "color": _spec("int", doc="RGB integer"),
+        "color_index": _spec("int"),
+        "mute": _spec("bool"),
+        "solo": _spec("bool"),
+        "arm": _spec("bool", doc="Only tracks with can_be_armed"),
+        "implicit_arm": _spec("bool"),
+        "fold_state": _spec("bool", doc="Group track folded"),
+        "current_monitoring_state": _spec("enum", enum="Live.Track.Track.monitoring_states", doc="IN / AUTO / OFF"),
+        "volume": _spec("float", doc="Mixer volume (device value, 0..1, 0.85 = 0 dB)", lo=0.0, hi=1.0, get=_volume_get, set=_volume_set),
+        "panning": _spec("float", doc="Mixer pan, -1..1", lo=-1.0, hi=1.0, get=_pan_get, set=_pan_set),
+        "crossfade_assign": _spec("enum", enum="Live.MixerDevice.MixerDevice.crossfade_assignments", doc="Regular and return tracks: A, NONE or B",
+                                  get=_mixer_get("crossfade_assign"), set=_mixer_set("crossfade_assign")),
+        "panning_mode": _spec("enum", enum="Live.MixerDevice.MixerDevice.panning_modes", doc="stereo or stereo_split (then use the mixer/left_split_stereo and right_split_stereo parameters)",
+                              get=_mixer_get("panning_mode"), set=_mixer_set("panning_mode")),
+        "can_be_armed": _spec("bool", RO),
+        "can_be_frozen": _spec("bool", RO),
+        "is_frozen": _spec("bool", RO),
+        "is_foldable": _spec("bool", RO),
+        "is_grouped": _spec("bool", RO),
+        "is_visible": _spec("bool", RO),
+        "muted_via_solo": _spec("bool", RO),
+        "has_audio_input": _spec("bool", RO),
+        "has_audio_output": _spec("bool", RO),
+        "has_midi_input": _spec("bool", RO),
+        "has_midi_output": _spec("bool", RO),
+        "playing_slot_index": _spec("int", RO),
+        "fired_slot_index": _spec("int", RO),
+        "input_meter_level": _spec("float", RO),
+        "output_meter_level": _spec("float", RO),
+        "input_meter_left": _spec("float", RO),
+        "input_meter_right": _spec("float", RO),
+        "output_meter_left": _spec("float", RO),
+        "output_meter_right": _spec("float", RO),
+        "performance_impact": _spec("float", RO),
+        "is_part_of_selection": _spec("bool", RO),
+        "can_show_chains": _spec("bool", RO, doc="Instrument racks: whether the track can show its chains"),
+        "is_showing_chains": _spec("bool", doc="Instrument racks: chains shown as Session tracks"),
+        "back_to_arranger": _spec("bool", doc="Session clip launches on this track have taken it off the arrangement"),
+    },
+    "scene": {
+        "name": _spec("str"),
+        "color": _spec("int"),
+        "color_index": _spec("int"),
+        "tempo": _spec("float", doc="Scene tempo override, BPM", lo=20.0, hi=999.0),
+        "tempo_enabled": _spec("bool"),
+        "time_signature_numerator": _spec("int", lo=1, hi=99),
+        "time_signature_denominator": _spec("int", doc="1, 2, 4, 8 or 16"),
+        "time_signature_enabled": _spec("bool"),
+        "is_empty": _spec("bool", RO),
+        "is_triggered": _spec("bool", RO),
+    },
+    "slot": {
+        "has_clip": _spec("bool", RO),
+        "has_stop_button": _spec("bool"),
+        "is_playing": _spec("bool", RO),
+        "is_recording": _spec("bool", RO),
+        "is_triggered": _spec("bool", RO),
+        "is_group_slot": _spec("bool", RO),
+        "controls_other_clips": _spec("bool", RO),
+        "will_record_on_start": _spec("bool", RO),
+        "color": _spec("int", RO),
+        "color_index": _spec("int", RO),
+        "playing_status": _spec("enum", RO, enum="Live.ClipSlot.ClipSlotPlayingState"),
+    },
+    "clip": {
+        "name": _spec("str"),
+        "color": _spec("int"),
+        "color_index": _spec("int"),
+        "muted": _spec("bool"),
+        "looping": _spec("bool"),
+        "loop_start": _spec("float", doc="beats"),
+        "loop_end": _spec("float", doc="beats"),
+        "start_marker": _spec("float", doc="beats"),
+        "end_marker": _spec("float", doc="beats"),
+        "position": _spec("float", doc="beats"),
+        "signature_numerator": _spec("int"),
+        "signature_denominator": _spec("int"),
+        "launch_mode": _spec("enum", enum="Live.Clip.LaunchMode"),
+        "launch_quantization": _spec("enum", enum="Live.Clip.ClipLaunchQuantization"),
+        "legato": _spec("bool"),
+        "velocity_amount": _spec("float", doc="0..1: how much note velocity affects clip volume", lo=0.0, hi=1.0),
+        "root_note": _spec("int", lo=0, hi=11),
+        "scale_name": _spec("str"),
+        "scale_mode": _spec("bool"),
+        "scale_intervals": _spec("list", RO),
+        "gain": _spec("float", doc="Audio clips only"),
+        "pitch_coarse": _spec("int", doc="Audio clips only, semitones"),
+        "pitch_fine": _spec("float", doc="Audio clips only, cents"),
+        "warping": _spec("bool", doc="Audio clips only"),
+        "warp_mode": _spec("enum", enum="Live.Clip.WarpMode", doc="Audio clips only"),
+        "ram_mode": _spec("bool", doc="Audio clips only"),
+        "length": _spec("float", RO, doc="beats"),
+        "start_time": _spec("float", RO),
+        "end_time": _spec("float", RO),
+        "playing_position": _spec("float", RO),
+        "is_playing": _spec("bool", RO),
+        "is_triggered": _spec("bool", RO),
+        "is_recording": _spec("bool", RO),
+        "is_overdubbing": _spec("bool", RO),
+        "is_audio_clip": _spec("bool", RO),
+        "is_midi_clip": _spec("bool", RO),
+        "is_session_clip": _spec("bool", RO),
+        "is_arrangement_clip": _spec("bool", RO),
+        "file_path": _spec("str", RO, doc="Audio clips only"),
+        "sample_rate": _spec("float", RO, doc="Audio clips only"),
+        "sample_length": _spec("int", RO, doc="Audio clips only, samples"),
+        "gain_display_string": _spec("str", RO, doc="Audio clips only, e.g. '-3.0 dB'"),
+        "available_warp_modes": _spec("list", RO, doc="Audio clips only: the warp_mode values this clip accepts"),
+        "warp_markers": _spec("list", RO, doc="Audio clips only: [{beat_time, sample_time (seconds in the file)}]; edit with clip_action", get=_warp_markers_get),
+        "has_envelopes": _spec("bool", RO),
+        "has_groove": _spec("bool", RO),
+        "groove": _spec("ref", ref="groove", doc="Address of a groove in the pool (grooves/N); a clip always has one"),
+        "is_take_lane_clip": _spec("bool", RO),
+        "will_record_on_start": _spec("bool", RO),
+    },
+    "device": {
+        "name": _spec("str"),
+        "class_name": _spec("str", RO),
+        "class_display_name": _spec("str", RO),
+        "type": _spec("enum", RO, enum="Live.Device.DeviceType"),
+        "is_active": _spec("bool", RO, doc="False when the device or something above it is switched off"),
+        "on": _spec("bool", doc="The device's own on/off switch (its 'Device On' parameter)", get=_device_on_get, set=_device_on_set),
+        "collapsed": _spec("bool", doc="Device shown collapsed in the device chain", get=_collapsed_get, set=_collapsed_set),
+        "can_have_chains": _spec("bool", RO, doc="True for racks"),
+        "can_have_drum_pads": _spec("bool", RO, doc="True for Drum Racks"),
+        "can_compare_ab": _spec("bool", RO),
+        "is_using_compare_preset_b": _spec("bool", doc="A/B compare: the B preset is loaded"),
+        "latency_in_ms": _spec("float", RO),
+        "latency_in_samples": _spec("int", RO),
+        "can_show_chains": _spec("bool", RO, doc="Racks only"),
+        "is_showing_chains": _spec("bool", doc="Racks only: chains shown as Session tracks"),
+        "has_drum_pads": _spec("bool", RO, doc="Drum Racks only"),
+        "has_macro_mappings": _spec("bool", RO, doc="Racks only"),
+        "macros_mapped": _spec("list", RO, doc="Racks only: one flag per macro"),
+        "visible_macro_count": _spec("int", RO, doc="Racks only"),
+        "variation_count": _spec("int", RO, doc="Racks only: stored macro variations"),
+        "selected_variation_index": _spec("int", doc="Racks only: the variation recall_variation would recall"),
+    },
+    "chain": {
+        "name": _spec("str"),
+        "color": _spec("int"),
+        "color_index": _spec("int"),
+        "is_auto_colored": _spec("bool"),
+        "mute": _spec("bool"),
+        "solo": _spec("bool"),
+        "muted_via_solo": _spec("bool", RO),
+        "volume": _spec("float", doc="Chain mixer volume (device value, 0..1, 0.85 = 0 dB)", lo=0.0, hi=1.0, get=_volume_get, set=_volume_set),
+        "panning": _spec("float", doc="Chain mixer pan, -1..1", lo=-1.0, hi=1.0, get=_pan_get, set=_pan_set),
+        "has_audio_input": _spec("bool", RO),
+        "has_audio_output": _spec("bool", RO),
+        "has_midi_input": _spec("bool", RO),
+        "has_midi_output": _spec("bool", RO),
+    },
+    "pad": {
+        "name": _spec("str", RO),
+        "note": _spec("int", RO),
+        "mute": _spec("bool"),
+        "solo": _spec("bool"),
+    },
+    "parameter": {
+        "value": _spec("float", doc="Raw value within min..max; a quantized parameter also takes its label (e.g. 'Low-pass')", coerce=_parameter_value),
+        "name": _spec("str", RO),
+        "original_name": _spec("str", RO),
+        "min": _spec("float", RO),
+        "max": _spec("float", RO),
+        "default_value": _spec("float", RO, doc="Not available for quantized parameters"),
+        "is_quantized": _spec("bool", RO),
+        "is_enabled": _spec("bool", RO, doc="False when macro-mapped or disabled by another parameter"),
+        "display": _spec("str", doc="The value as Live shows it ('14.2 kHz'). Writable: give the display you want ('35 Hz', '-26 dB', '129 ms', or a label for a quantized parameter) "
+                                    "instead of a raw value; the nearest displayable value is found, and one Live cannot show is refused with the nearest option",
+                         get=_display_get, set=_display_set, coerce=_parameter_display),
+        "value_items": _spec("list", RO, doc="Labels of a quantized parameter", get=_value_items_get),
+        "automation_state": _spec("int", RO, doc="0 none, 1 automation playing, 2 overridden"),
+        "state": _spec("int", RO),
+    },
+    "lane": {
+        "name": _spec("str"),
+    },
+    "sample": {},          # a Simpler's sample: its properties come from the Sample class (device_specific)
+    "cue": {
+        "name": _spec("str"),
+        "time": _spec("float", RO, doc="Position in beats"),
+    },
+    "app": {
+        "average_process_usage": _spec("float", RO, doc="CPU load, average"),
+        "peak_process_usage": _spec("float", RO, doc="CPU load, peak since the last read"),
+        "open_dialog_count": _spec("int", RO),
+        "current_dialog_message": _spec("str", RO),
+        "current_dialog_button_count": _spec("int", RO),
+        "number_of_push_apps_running": _spec("int", RO),
+    },
+    "groove": {
+        "name": _spec("str"),
+        "base": _spec("enum", enum="Live.Groove.Base", doc="The grid the groove is laid on"),
+        "timing_amount": _spec("float", doc="percent"),
+        "quantization_amount": _spec("float", doc="percent"),
+        "random_amount": _spec("float", doc="percent"),
+        "velocity_amount": _spec("float", doc="percent"),
+    },
+    "view": {
+        "selected_track": _spec("ref", ref="track", doc="Track selected in Live's window: tracks/N, returns/N or master. Writing it moves the user's selection"),
+        "selected_scene": _spec("ref", ref="scene", doc="Scene selected in the Session view"),
+        "highlighted_clip_slot": _spec("ref", ref="slot", doc="The slot at the selected track and scene (none for returns and the master)"),
+        "detail_clip": _spec("ref", ref="clip", doc="Clip shown in the Detail view (null when none); write any clip address, Session or arrangement"),
+        "selected_chain": _spec("ref", ref="chain", doc="Rack chain highlighted in the device view (null when none)"),
+        "selected_parameter": _spec("ref", RO, ref="parameter", doc="Device parameter selected in Live's window (null when none)"),
+        "selected_device": _spec("ref", ref="device", doc="Device selected in the selected track's device chain; writing it selects (and appoints) that device",
+                                 get=_selected_device_get, set=_selected_device_set),
+        "follow_song": _spec("bool", doc="The Arrangement view scrolls with the playhead"),
+        "draw_mode": _spec("bool", doc="Envelope / note draw mode"),
+    },
+    "app_view": {
+        "focused_document_view": _spec("str", doc="'Session' or 'Arranger': the view in front. Writing it brings that view forward",
+                                       get=lambda view: view.focused_document_view, set=_focus_document_view, coerce=_document_view),
+        "visible_views": _spec("list", RO, doc="Panels showing now: Browser, Arranger, Session, Detail, Detail/Clip, Detail/DeviceChain", get=_visible_views),
+        "available_views": _spec("list", RO, doc="Every panel name Live knows", get=_available_views),
+        "browse_mode": _spec("bool", RO, doc="Hot-swap (browse) mode is on"),
+    },
+    "track_view": {
+        "is_collapsed": _spec("bool", doc="Track shown collapsed in the Arrangement"),
+        "selected_device": _spec("ref", RO, ref="device", doc="Device selected in this track's device chain (null when none)"),
+    },
+    "clip_view": {
+        "grid_quantization": _spec("enum", enum="Live.Clip.GridQuantization", doc="Grid resolution of the clip editor"),
+        "grid_is_triplet": _spec("bool", doc="Grid shown in triplet mode"),
+    },
+    "device_view": {
+        "is_collapsed": _spec("bool", doc="Device shown collapsed in the device chain (the device's `collapsed` is the same switch)"),
+    },
+}
+
+# What a device's view offers beyond is_collapsed, by kind of device: (Live view class, specs). A view is matched through its device.
+DEVICE_VIEW_EXTRAS = {
+    "rack": ("Live.RackDevice.RackDevice.View", {
+        "is_showing_chain_devices": _spec("bool", doc="The devices of the selected chain are shown"),
+        "selected_chain": _spec("ref", ref="chain", doc="The selected chain (null when none)"),
+    }),
+    "drum_rack": ("Live.RackDevice.RackDevice.View", {
+        "selected_drum_pad": _spec("ref", ref="pad", doc="The selected drum pad (null when none)"),
+        "drum_pads_scroll_position": _spec("int", doc="Index of the lowest visible row of pads", lo=0),
+    }),
+    "eq8": ("Live.Eq8Device.Eq8Device.View", {
+        "selected_band": _spec("int", doc="Filter band shown in the editor, 0 to 7", lo=0, hi=7),
+    }),
+    "simpler": ("Live.SimplerDevice.SimplerDevice.View", {
+        "selected_slice": _spec("int", doc="Selected slice"),
+        "sample_start": _spec("int", RO, doc="Start of the sample as modulated now, in samples (-1: no sample)"),
+        "sample_end": _spec("int", RO, doc="End of the sample as modulated now, in samples (-1: no sample)"),
+        "sample_loop_start": _spec("int", RO, doc="Loop start as modulated now, in samples (-1: none)"),
+        "sample_loop_end": _spec("int", RO, doc="Loop end as modulated now, in samples (-1: none)"),
+        "sample_loop_fade": _spec("int", RO, doc="Loop fade as modulated now, in samples (-1: none)"),
+        "sample_env_fade_in": _spec("int", RO, doc="Envelope fade-in, in samples"),
+        "sample_env_fade_out": _spec("int", RO, doc="Envelope fade-out, in samples"),
+    }),
+}
+
+
+# What the chains of a Drum Rack (Live's DrumChain, a Chain with a note mapping) have beyond an ordinary chain. Live refuses values outside these.
+DRUM_CHAIN_SPECS = {
+    "choke_group": _spec("int", doc="Choke group 1 to 16, or 0 for none: a pad cuts off the others in its group (open and closed hi-hat)", lo=0, hi=16),
+    "in_note": _spec("int", doc="The MIDI note that triggers this chain, 0 to 127", lo=0, hi=127),
+    "out_note": _spec("int", doc="The MIDI note sent to the devices in the chain, 0 to 127", lo=0, hi=127),
+}
+DRUM_CHAIN_CLASS = "Live.DrumChain.DrumChain"
+
+
+def _is_drum_chain(chain):
+    return device_addressing._is(chain, "DrumChain", "DrumChain")
+
+
+def _device_view_flavors(view):
+    """Which DEVICE_VIEW_EXTRAS apply to a device's view, judged from the device it belongs to."""
+    device = _safe_attr(view, "canonical_parent")
+    if device is None:
+        return []
+    flavors = []
+    if _safe_attr(device, "can_have_chains", False):
+        flavors.append("rack")
+    if _safe_attr(device, "can_have_drum_pads", False):
+        flavors.append("drum_rack")
+    class_name = _safe_attr(device, "class_name")
+    if class_name == "Eq8":
+        flavors.append("eq8")
+    elif class_name == "OriginalSimpler":
+        flavors.append("simpler")
+    return flavors
+
+
+def _enum_class(path):
+    """Resolve a dotted Live enum path such as 'Live.Clip.LaunchMode'."""
+    target = Live
+    for part in path.split(".")[1:]:
+        target = getattr(target, part)
+    return target
+
+
+def _enum_names(path):
+    """name -> int table of a Live enum (Boost exposes it as `.names`; the 'count' sentinel is dropped)."""
+    return dict((k, int(v)) for k, v in _enum_class(path).names.items() if k != "count")
+
+
+def _read(obj, name, spec):
+    value = spec["get"](obj) if spec["get"] else getattr(obj, name)
+    if spec["type"] == "enum":
+        by_value = dict((v, k) for k, v in _enum_names(spec["enum"]).items())
+        return by_value.get(int(value), int(value))
+    if spec["type"] == "list":
+        return list(value)
+    return value
+
+
+def _coerce(name, spec, value):
+    """Validate a caller value against the spec and convert it to what Live's setter accepts."""
+    kind = spec["type"]
+    if kind == "bool":
+        if not isinstance(value, bool):
+            raise BridgeError("{0} must be true or false".format(name), "TYPE_ERROR")
+        return value
+    if kind == "int":
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
+            raise BridgeError("{0} must be an integer".format(name), "TYPE_ERROR")
+        value = int(value)
+    elif kind == "float":
+        if not _is_number(value):
+            raise BridgeError("{0} must be a number".format(name), "TYPE_ERROR")
+        value = float(value)
+    elif kind == "str":
+        if not isinstance(value, str):
+            raise BridgeError("{0} must be a string".format(name), "TYPE_ERROR")
+        return value
+    elif kind == "enum":
+        names = _enum_names(spec["enum"])
+        if not isinstance(value, str) or value not in names:
+            raise BridgeError("{0} must be one of: {1}".format(name, ", ".join(sorted(names, key=names.get))), "INVALID_ARGUMENT")
+        return names[value]
+    else:
+        raise BridgeError("{0} cannot be written".format(name), "INVALID_ARGUMENT")
+    if spec["min"] is not None and value < spec["min"] or spec["max"] is not None and value > spec["max"]:
+        raise BridgeError("{0} {1} is outside {2} to {3}".format(name, value, spec["min"], spec["max"]), "OUT_OF_RANGE")
+    return value
+
+
+MASTER_SPECS = {
+    "crossfader": _spec("float", doc="Crossfader position, -1 (A) to 1 (B)", lo=-1.0, hi=1.0, get=_mixer_value_get("crossfader"), set=_mixer_value_set("crossfader")),
+    "cue_volume": _spec("float", doc="Cue (headphone) volume, device value 0..1", lo=0.0, hi=1.0, get=_mixer_value_get("cue_volume"), set=_mixer_value_set("cue_volume")),
+}
+
+
+def _is_master(track):
+    """Only the master's mixer has a crossfader and a cue volume."""
+    try:
+        return track.mixer_device.crossfader is not None
+    except Exception:
+        return False
+
+
+def _kind_specs(kind, obj=None):
+    """The property table of a kind; a device (or a Simpler's sample) also has the properties of its own class, the master its crossfader."""
+    if kind == "track" and obj is not None and _is_master(obj):
+        return dict(PROPERTY_SPECS["track"], **MASTER_SPECS)
+    if kind == "device" and obj is not None:
+        extras = device_specific.specs_for_device(obj)
+        return dict(PROPERTY_SPECS["device"], **extras) if extras else PROPERTY_SPECS["device"]
+    if kind == "sample":
+        return device_specific.specs_for_sample()
+    if kind == "chain" and obj is not None and _is_drum_chain(obj):
+        return dict(PROPERTY_SPECS[kind], **DRUM_CHAIN_SPECS)
+    if kind == "device_view" and obj is not None:
+        specs = dict(PROPERTY_SPECS[kind])
+        for flavor in _device_view_flavors(obj):
+            specs.update(DEVICE_VIEW_EXTRAS[flavor][1])
+        return specs
+    return PROPERTY_SPECS[kind]
+
+
+class PropertiesMixin(object):
+    """get_properties / set_properties / list_properties over addresses."""
+
+    def _value(self, obj, name, spec):
+        """Read a property as the caller sees it: enums by name, referenced objects by address."""
+        value = _read(obj, name, spec)
+        if spec["type"] == "ref":
+            return None if value is None else self._address_of(value)
+        return value
+
+    def _resolve_ref(self, name, spec, value):
+        if not isinstance(value, str):
+            raise BridgeError("{0} must be the address of a {1} (for example 'grooves/0')".format(name, spec["ref"]), "TYPE_ERROR")
+        kind, target, canonical = self._resolve(value)
+        if kind != spec["ref"]:
+            raise BridgeError("{0} must be the address of a {1}, but '{2}' is a {3}".format(name, spec["ref"], canonical, kind), "TYPE_ERROR")
+        return target
+
+    def _get_properties(self, address, names=None):
+        kind, obj, canonical = self._resolve(address)
+        specs = _kind_specs(kind, obj)
+        if names is not None:
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                raise BridgeError("names must be a list of property names", "INVALID_ARGUMENT")
+            unknown = [n for n in names if n not in specs]
+            if unknown:
+                raise BridgeError("Unknown {0} properties: {1}. Valid: {2}".format(kind, unknown, sorted(specs)), "NOT_FOUND")
+        values, unavailable = {}, {}
+        for name in (names if names is not None else sorted(n for n in specs if not specs[n].get("on_request"))):
+            try:
+                values[name] = self._value(obj, name, specs[name])
+            except Exception as e:
+                if names is not None:
+                    raise
+                unavailable[name] = "not available on this object" if isinstance(e, (RuntimeError, AttributeError)) else str(e)
+        result = {"address": canonical, "kind": kind, "properties": values}
+        if unavailable:
+            result["unavailable"] = unavailable
+        return result
+
+    def _set_properties(self, address, values, expect=None):
+        kind, obj, canonical = self._resolve(address)
+        self._guard(obj, expect, canonical)
+        if not isinstance(values, dict) or not values:
+            raise BridgeError("properties must be a non-empty object of name: value", "INVALID_ARGUMENT")
+        specs = _kind_specs(kind, obj)
+        if kind == "parameter" and "value" in values and "display" in values:
+            raise BridgeError("give either value or display, not both", "INVALID_ARGUMENT")
+        raw_before = obj.value if kind == "parameter" and "display" in values else None
+        pending = {}
+        for name, value in values.items():
+            if name not in specs:
+                raise BridgeError("Unknown {0} property '{1}'. Valid: {2}".format(kind, name, sorted(specs)), "NOT_FOUND")
+            if not specs[name]["rw"]:
+                raise BridgeError("{0} is read-only".format(name), "INVALID_ARGUMENT")
+            if specs[name]["type"] == "ref":
+                pending[name] = self._resolve_ref(name, specs[name], value)
+            elif specs[name]["coerce"]:
+                pending[name] = specs[name]["coerce"](obj, value)
+            else:
+                pending[name] = _coerce(name, specs[name], value)
+        before = dict((name, self._value(obj, name, specs[name])) for name in pending)
+        # Apply in passes: Live enforces ordering between properties (e.g. loop_end before loop_start), so retry the
+        # writes that raise until a pass makes no progress. On failure, restore what was already written so the call
+        # is all-or-nothing.
+        def write(name, value):
+            spec = specs[name]
+            if spec["set"]:
+                spec["set"](obj, value)
+            else:
+                setattr(obj, name, value)
+
+        errors, done = {}, []
+        while pending:
+            progressed = False
+            for name in list(pending):
+                try:
+                    write(name, pending[name])
+                    del pending[name]
+                    done.append(name)
+                    progressed = True
+                except Exception as e:
+                    errors[name] = e
+            if not progressed:
+                for name in reversed(done):
+                    try:
+                        if name == "display" and raw_before is not None:
+                            obj.value = raw_before          # exact: the displayed text only approximates the old value
+                        else:
+                            write(name, self._writable_value(specs[name], before[name], obj))
+                    except Exception:
+                        pass
+                raise errors[sorted(pending)[0]]
+        applied = {}
+        for name in values:
+            applied[name] = {"from": before[name], "to": self._value(obj, name, specs[name])}
+        return {"address": canonical, "kind": kind, "applied": applied}
+
+    def _writable_value(self, spec, value, obj=None):
+        """Turn a value read back for the caller (enum name, object address, device label) into what the setter takes."""
+        if spec["type"] == "choice" and isinstance(value, str):
+            return spec["coerce"](obj, value)
+        if spec["type"] == "enum" and isinstance(value, str):
+            return _enum_names(spec["enum"])[value]
+        if spec["type"] == "ref" and isinstance(value, str):
+            return self._resolve(value)[1]
+        return value
+
+    def _list_properties(self, address=None, kind=None):
+        obj = None
+        if address is not None:
+            kind, obj, _canonical = self._resolve(address)
+        if kind not in PROPERTY_SPECS:
+            raise BridgeError("kind must be one of: {0}".format(", ".join(sorted(PROPERTY_SPECS))), "INVALID_ARGUMENT")
+        table = _kind_specs(kind, obj)
+        listing = {}
+        for name, spec in sorted(table.items()):
+            entry = {"type": spec["type"], "writable": spec["rw"]}
+            if spec["enum"]:
+                entry["values"] = sorted(_enum_names(spec["enum"]), key=_enum_names(spec["enum"]).get)
+            if spec.get("options") and obj is not None:
+                try:
+                    entry["values"] = list(spec["options"](obj))
+                except Exception:
+                    pass
+            for key in ("doc", "min", "max", "ref"):
+                if spec[key] not in (None, ""):
+                    entry["refers_to" if key == "ref" else key] = spec[key]
+            if spec.get("on_request"):
+                entry["read_on_request"] = True
+            listing[name] = entry
+        result = {"kind": kind, "properties": listing}
+        if obj is not None and kind in ("device", "sample"):
+            methods = device_specific.methods_for(kind, obj)
+            if methods:
+                result["methods"] = methods
+        # What Live exposes that this tool does not (yet): visible gaps instead of hidden ones
+        known = api_registry.class_properties(api_registry.KIND_CLASSES[kind])
+        result["not_exposed"] = dict((name, {"type": info["get"], "writable": info["set"] is not None})
+                                     for name, info in sorted(known.items()) if name not in PROPERTY_SPECS[kind])
+        return result
+
+    @command("get_properties")
+    def _cmd_get_properties(self, params):
+        return self._get_properties(params.get("address"), params.get("names"))
+
+    @command("set_properties", writes=True)
+    def _cmd_set_properties(self, params):
+        if "items" in params:
+            return {"results": [self._set_properties(i.get("address"), i.get("properties"), i.get("expect")) for i in params["items"]]}
+        return self._set_properties(params.get("address"), params.get("properties"), params.get("expect"))
+
+    @command("list_properties")
+    def _cmd_list_properties(self, params):
+        return self._list_properties(params.get("address"), params.get("kind"))
