@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hangero": {
+      "command": "node",
+      "args": ["src/mcp.js"]
+    }
+  }
+}
