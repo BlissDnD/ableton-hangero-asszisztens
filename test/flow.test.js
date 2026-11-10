@@ -12,7 +12,7 @@ import { measure, recover, SCRATCH_NAME } from '../src/measure.js';
 import { buildReport, renderMarkdown, writeReport, samplesToCsv } from '../src/report.js';
 import { readJournal } from '../src/journal.js';
 import { compareReports } from '../src/compare.js';
-import { install, candidates, libraryFromCfg } from '../src/install.js';
+import { install, candidates, libraryFromCfg, normalizeLibrary, isDir } from '../src/install.js';
 import { parseArgs, main } from '../src/cli.js';
 import { MockLive } from '../testkit/mock-live.js';
 
@@ -301,4 +301,21 @@ test('hosszabb, élőhöz közeli futás: ritka hibák nem állítják meg a nap
     assert.ok(session.samples.length > 8);
     assert.ok(summarize(session).findings.some((f) => /2 lekérdezés hibázott/.test(f.text)));
   });
+});
+
+test('telepit: a Library.cfg fájlra mutató útvonalából is a User Library mappát adja (valós hiba javítása)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cfg-'));
+  const lib = path.join(root, 'Documents', 'Ableton', 'User Library');
+  fs.mkdirSync(path.join(lib, 'Templates'), { recursive: true });
+  fs.writeFileSync(path.join(lib, 'Templates', 'tracklsv2.als'), 'x');
+  const prefs = path.join(root, 'AppData', 'Roaming', 'Ableton', 'Live 12.1', 'Preferences');
+  fs.mkdirSync(prefs, { recursive: true });
+  fs.writeFileSync(path.join(prefs, 'Library.cfg'), `<Ableton><X Value="${path.join(lib, 'Templates', 'tracklsv2.als')}"/></Ableton>`);
+  const found = candidates({ env: { APPDATA: path.join(root, 'AppData', 'Roaming') }, platform: 'win32', home: root });
+  assert.equal(found[0].path, lib);
+  assert.ok(isDir(found[0].path));
+  assert.equal(normalizeLibrary('C:/Users/x/Documents/Ableton/User Library/Templates/a.als'), 'C:/Users/x/Documents/Ableton/User Library');
+  assert.equal(normalizeLibrary('C:\\Zene\\User Library\\'), 'C:\\Zene\\User Library');
+  assert.equal(normalizeLibrary('D:\\Valami'), 'D:\\Valami');
+  assert.equal(install({ libraryPath: found[0].path, dryRun: true }).files > 20, true);
 });

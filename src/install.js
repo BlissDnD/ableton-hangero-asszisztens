@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 export const VENDOR_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'vendor', 'AbletonMCP');
 
-const isDir = (p) => {
+export const isDir = (p) => {
   try { return fs.statSync(p).isDirectory(); } catch { return false; }
 };
 
@@ -24,6 +24,13 @@ export function libraryFromCfg(text) {
   return found;
 }
 
+// A Library.cfg gyakran a User Library ALATTI fájlra/mappára mutat (pl. ...\User Library\Templates\x.als):
+// mindig a "User Library" mappáig vágjuk vissza az útvonalat.
+export function normalizeLibrary(p) {
+  const m = /^(.*?[\\/]User Library)(?:[\\/].*)?$/i.exec(p);
+  return m ? m[1] : p;
+}
+
 export function candidates({ env = process.env, platform = process.platform, home = os.homedir() } = {}) {
   const list = [];
   if (env.ABLETON_USER_LIBRARY) list.push({ path: env.ABLETON_USER_LIBRARY, source: 'ABLETON_USER_LIBRARY környezeti változó' });
@@ -36,7 +43,10 @@ export function candidates({ env = process.env, platform = process.platform, hom
         const cfg = path.join(root, v, 'Preferences', 'Library.cfg');
         if (fs.existsSync(cfg)) {
           for (const p of libraryFromCfg(fs.readFileSync(cfg, 'utf8'))) {
-            if (/user library/i.test(p)) list.push({ path: p, source: `${v} / Library.cfg` });
+            if (/user library/i.test(p)) {
+              const lib = normalizeLibrary(p);
+              if (!list.some((c) => c.path === lib)) list.push({ path: lib, source: `${v} / Library.cfg` });
+            }
           }
         }
       }

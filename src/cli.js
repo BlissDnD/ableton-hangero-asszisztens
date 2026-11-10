@@ -11,7 +11,7 @@ import { summarize } from './analysis.js';
 import { buildReport, renderMarkdown, samplesToCsv, writeReport, TOOL } from './report.js';
 import { measure, planText, recover } from './measure.js';
 import { analyzeWavFile } from './audio.js';
-import { candidates, install } from './install.js';
+import { candidates, install, isDir } from './install.js';
 import { compareReports } from './compare.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -121,7 +121,7 @@ export async function main(argv) {
       const list = candidates();
       let lib = args.konyvtar;
       if (!lib) {
-        const found = list.find((c) => fs.existsSync(c.path));
+        const found = list.find((c) => isDir(c.path));
         if (!found) {
           console.log('Nem találom az Ableton User Library mappát. Nézd meg az Abletonban (Preferences → Library → User Library), és add meg:\n  hangero telepit --konyvtar "C:\\...\\User Library"');
           return 1;
