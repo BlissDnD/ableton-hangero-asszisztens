@@ -269,6 +269,15 @@ tool('visszavon', 'Az utolsó N módosítás-csomag (hangerő/MIDI) visszacsiná
       const entry = list.pop();
       for (const op of [...entry.ops].reverse()) {
         if (op.type === 'set_props') await bridge.send('set_properties', { address: op.address, properties: op.before });
+        if (op.type === 'notes_remove') await bridge.send('edit_notes', { address: op.address, action: 'remove', ids: op.ids });
+        if (op.type === 'notes_add') await bridge.send('write_notes', { address: op.address, notes: op.notes });
+        if (op.type === 'clip_muted') {
+          const { arr } = await trackClips(op.track);
+          const c = arr.find((x) => Math.abs(x.start - op.start) < EPS && x.name === op.name);
+          if (c) await bridge.send('set_properties', { address: `tracks/${op.track}/arrangement/${c.index}`, properties: { muted: op.before } });
+        }
+        if (op.type === 'clip_delete_by_start') await deleteArrangementClip(op.track, op.name, op.start);
+        if (op.type === 'clip_restore') await placeMidiClip(op.track, op.saved, op.saved.start);
         if (op.type === 'note_modify') await bridge.send('edit_notes', { address: op.address, action: 'modify', changes: [{ id: op.id, ...op.before }] });
       }
       undone.push(entry.label);
@@ -307,6 +316,146 @@ tool('meres', 'Valódi hangosságmérés a Main kimenetről (LUFS, true peak, RM
     const report = buildReport({ session: { ...session, role: a.szerep ?? session.role }, summary, check, measurement: result.measurement, sideEffects: result.sideEffects });
     const files = writeReport(report, path.join(ROOT, 'jelentesek'));
     return text(`${renderMarkdown(report)}\n\n(Mentve: ${files.mdPath})`);
+  });
+
+// ---------- idővonal-klipek (Arrangement) és MIDI-hangok szerkesztése ----------
+const EPS = 0.01;
+async function trackClips(trackIdx) {
+  const info = await bridge.send('get_track_info', { track_index: trackIdx });
+  const arr = (info.arrangement_clips || []).map((c, i) => ({ index: i, name: c.name, start: c.start_time, length: c.length, end: c.start_time + c.length, muted: c.muted, midi: c.is_midi_clip }));
+  return { info, arr };
+}
+async function setupContext(savSel) {
+  const set = await bridge.send('describe_set', { include_clips: false, include_scenes: false });
+  const [t] = findTracks(set, [savSel]);
+  if (!t.address.startsWith('tracks/')) throw new Error('Csak normál sávon működik.');
+  return { set, t, ti: Number(t.address.split('/')[1]), bpb: beatsPerBar(set) };
+}
+function pickClip(arr, bar, bpb) {
+  const beat = (bar - 1) * bpb;
+  const hit = arr.filter((c) => c.start <= beat + EPS && c.end > beat + EPS);
+  if (!hit.length) throw new Error(`Nincs klip a(z) ${bar}. ütemnél ezen a sávon.`);
+  return hit[0];
+}
+async function snapshotMidiClip(ti, c) {
+  const addr = `tracks/${ti}/arrangement/${c.index}`;
+  const notes = (await bridge.send('get_notes', { address: addr, limit: 5000 })).notes.map(({ id, ...n }) => n);
+  const p = (await bridge.send('get_properties', { address: addr, names: ['name', 'looping', 'loop_start', 'loop_end', 'start_marker', 'end_marker', 'muted', 'length'] })).properties;
+  return { start: c.start, name: c.name, notes, props: p };
+}
+/** MIDI-klip tartalmát átmeneti Session-klipen át teszi az idővonalra a megadott pozícióra; az átmeneti klipet törli. */
+async function placeMidiClip(ti, saved, destBeat) {
+  const info = await bridge.send('get_track_info', { track_index: ti });
+  const slotIdx = (info.clip_slots || []).findIndex((s) => !s.has_clip);
+  if (slotIdx < 0) throw new Error('Nincs üres Session-slot ezen a sávon az átmeneti klipnek. Ürítsd ki az egyik slotot.');
+  const slotClip = `tracks/${ti}/slots/${slotIdx}/clip`;
+  const p = saved.props;
+  await bridge.send('create_clip', { track_index: ti, clip_index: slotIdx, length: Math.max(0.25, p.length, p.loop_end || 0) });
+  try {
+    if (saved.notes.length) await bridge.send('write_notes', { address: slotClip, notes: saved.notes });
+    await bridge.send('set_properties', { address: slotClip, properties: { looping: p.looping, loop_start: p.loop_start, loop_end: p.loop_end, start_marker: p.start_marker, end_marker: p.end_marker } });
+    const placed = await bridge.send('clip_action', { address: slotClip, action: 'to_arrangement', time: destBeat });
+    try { await bridge.send('set_properties', { address: placed.address, properties: { name: p.name, muted: p.muted } }); } catch { /* név/némítás nem kritikus */ }
+    return placed;
+  } finally {
+    try {
+      const nm = (await bridge.send('get_properties', { address: slotClip, names: ['name'] })).properties.name;
+      await bridge.send('delete', { address: slotClip, expect: { name: nm } });
+    } catch (e) { console.error('átmeneti klip törlése sikertelen:', e.message); }
+  }
+}
+async function deleteArrangementClip(ti, name, start) {
+  const { arr } = await trackClips(ti);
+  const c = arr.find((x) => Math.abs(x.start - start) < EPS && x.name === name);
+  if (!c) throw new Error('A törlendő klip már nincs ott.');
+  await bridge.send('delete', { address: `tracks/${ti}/arrangement/${c.index}`, expect: { name } });
+}
+
+tool('klip_muvelet',
+  'Idővonal (Arrangement) MIDI-klipek: masol (másolat a cel_utem-re), athelyez (másolás + az eredeti törlése), torol, nemit. Helyek ütemben (1-től); a klipet az ütemszámával jelöld ki (bármely ütem, ahol a klip van). Alapból csak ELŐNÉZET (vegrehajt:true kell). Ha a cél terület foglalt, megáll (felulir:true felülírja, a Live a fedett részt kitörli!). Audio-klipet nem tud másolni/mozgatni (API-korlát), csak némítani. Visszavonható (visszavon). Működéséhez a sávon kell egy üres Session-slot.',
+  { muvelet: { type: 'string', enum: ['masol', 'athelyez', 'torol', 'nemit'] }, sav: { type: 'string' }, klip_utem: { type: 'number', description: 'Melyik klipet: az az ütem, ahol a klip van (1-től)' }, cel_utem: { type: 'number', description: 'masol/athelyez: hova (1-től)' }, ismetles: { type: 'number', description: 'masol: ennyi másolat egymás után (alap 1)' }, nemitva: { type: 'boolean', description: 'nemit: igaz = némít, hamis = némítás megszüntetése' }, felulir: { type: 'boolean' }, vegrehajt: { type: 'boolean' } }, ['muvelet', 'sav', 'klip_utem'],
+  async (a) => {
+    const { t, ti, bpb } = await setupContext(a.sav);
+    const { arr } = await trackClips(ti);
+    const src = pickClip(arr, a.klip_utem, bpb);
+    const desc = { sav: t.name, klip: src.name, kezdet_utem: beatToBar(src.start, bpb), veg_utem: beatToBar(src.end, bpb), hossz_utem: r2(src.length / bpb), tipus: src.midi ? 'midi' : 'audio', nemitva: src.muted };
+    if (a.muvelet === 'nemit') {
+      const target = a.nemitva ?? true;
+      if (!a.vegrehajt) return text({ elonezet: true, klip: desc, uj_nemitva: target });
+      await bridge.send('set_properties', { address: `tracks/${ti}/arrangement/${src.index}`, properties: { muted: target } });
+      pushUndo(`klip nemit ${t.name}`, [{ type: 'clip_muted', track: ti, name: src.name, start: src.start, before: src.muted }]);
+      return text({ kesz: true, klip: desc, uj_nemitva: target });
+    }
+    if (a.muvelet === 'torol') {
+      if (!a.vegrehajt) return text({ elonezet: true, torolni_fog: desc });
+      if (!src.midi) throw new Error('Audio-klipet nem törlök, mert visszavonni nem tudnám (nincs tartalom-mentés). Töröld kézzel, vagy némítsd.');
+      const saved = await snapshotMidiClip(ti, src);
+      await deleteArrangementClip(ti, src.name, src.start);
+      pushUndo(`klip torol ${t.name}`, [{ type: 'clip_restore', track: ti, saved }]);
+      return text({ kesz: true, torolve: desc, visszavonas: 'visszavon' });
+    }
+    if (!src.midi) throw new Error('Audio-klipet az API nem tud másolni/mozgatni az idővonalon (csak MIDI-t). Kézzel, vagy .als-másolaton át lehetséges.');
+    if (typeof a.cel_utem !== 'number') throw new Error('Add meg a cel_utem-et.');
+    const times = Math.max(1, Math.round(a.ismetles || 1));
+    const destBeat0 = (a.cel_utem - 1) * bpb;
+    const plans = [];
+    for (let k = 0; k < times; k += 1) plans.push({ s: destBeat0 + k * src.length, e: destBeat0 + (k + 1) * src.length });
+    const others = arr.filter((c) => !(a.muvelet === 'athelyez' && c.index === src.index));
+    const conflicts = plans.flatMap((pl) => others.filter((c) => c.start < pl.e - EPS && c.end > pl.s + EPS).map((c) => `${c.name} (${beatToBar(c.start, bpb)}–${beatToBar(c.end, bpb)}. ütem)`));
+    const unique = [...new Set(conflicts)];
+    const out = { elonezet: !a.vegrehajt, muvelet: a.muvelet, forras: desc, uj_helyek_utem: plans.map((pl) => `${beatToBar(pl.s, bpb)}–${beatToBar(pl.e, bpb)}`), foglalt_terulet: unique.length ? unique : 'nincs' };
+    if (!a.vegrehajt) return text(out);
+    if (unique.length && !a.felulir) return text({ ...out, elonezet: false, megallt: 'A cél terület foglalt. Válassz üres helyet, vagy felulir:true (a Live kitörli a fedett részt, és azt a visszavon nem hozza vissza).' });
+    const saved = await snapshotMidiClip(ti, src);
+    const ops = [];
+    for (const pl of plans) {
+      await placeMidiClip(ti, saved, pl.s);
+      ops.push({ type: 'clip_delete_by_start', track: ti, name: saved.props.name, start: pl.s });
+    }
+    if (a.muvelet === 'athelyez') {
+      await deleteArrangementClip(ti, src.name, src.start);
+      ops.push({ type: 'clip_restore', track: ti, saved });
+    }
+    pushUndo(`klip ${a.muvelet} ${t.name}`, ops);
+    return text({ ...out, elonezet: false, kesz: true, visszavonas: 'visszavon' });
+  });
+
+tool('midi_hangok',
+  'MIDI-hangok hozzáadása, törlése, másolása klipek között. Alapból ELŐNÉZET (vegrehajt:true az íráshoz). Műveletek: hozzaad (hangok:[{p:hangmagasság 0–127, t:kezdet negyedben a klip elejétől, d:hossz negyedben, v:velocity}]), torol (idk, vagy tartomány: tol_negyed/ig_negyed és/vagy hangmagassag_min/max), masol (forrás klip tartományából a cel_cim klipbe, eltolas_negyed-del). Visszavonható.',
+  { cim: { type: 'string', description: 'A klip címe (pl. tracks/24/arrangement/3)' }, muvelet: { type: 'string', enum: ['hozzaad', 'torol', 'masol'] }, hangok: { type: 'array', items: { type: 'object', properties: { p: { type: 'number' }, t: { type: 'number' }, d: { type: 'number' }, v: { type: 'number' } }, required: ['p', 't', 'd'] } }, idk: { type: 'array', items: { type: 'number' } }, tol_negyed: { type: 'number' }, ig_negyed: { type: 'number' }, hangmagassag_min: { type: 'number' }, hangmagassag_max: { type: 'number' }, cel_cim: { type: 'string' }, eltolas_negyed: { type: 'number' }, vegrehajt: { type: 'boolean' } }, ['cim', 'muvelet'],
+  async (a) => {
+    const inRange = (n) => (a.tol_negyed == null || n.start_time >= a.tol_negyed - 1e-6) && (a.ig_negyed == null || n.start_time < a.ig_negyed - 1e-6) && (a.hangmagassag_min == null || n.pitch >= a.hangmagassag_min) && (a.hangmagassag_max == null || n.pitch <= a.hangmagassag_max);
+    const strip = ({ id, ...n }) => n;
+    if (a.muvelet === 'hozzaad') {
+      if (!Array.isArray(a.hangok) || !a.hangok.length) throw new Error('hangok: nem üres lista kell.');
+      const notes = a.hangok.map((h) => ({ pitch: Math.round(h.p), start_time: h.t, duration: h.d, velocity: h.v ?? 100 }));
+      if (!a.vegrehajt) return text({ elonezet: true, hozzaadna: notes.length, peldak: a.hangok.slice(0, 10) });
+      const r = await bridge.send('write_notes', { address: a.cim, notes });
+      pushUndo(`midi_hangok hozzaad ${a.cim}`, [{ type: 'notes_remove', address: a.cim, ids: r.ids }]);
+      return text({ kesz: true, hozzaadva: r.written, visszavonas: 'visszavon' });
+    }
+    const all = (await readNotes(a.cim)).notes;
+    if (a.muvelet === 'torol') {
+      if (!a.idk && a.tol_negyed == null && a.ig_negyed == null && a.hangmagassag_min == null && a.hangmagassag_max == null) throw new Error('Add meg, mit töröljek (idk, vagy tol_negyed/ig_negyed/hangmagassag_*).');
+      const victims = a.idk ? all.filter((n) => a.idk.includes(n.id)) : all.filter(inRange);
+      if (!a.vegrehajt) return text({ elonezet: true, torolne: victims.length, osszes: all.length, peldak: victims.slice(0, 10).map((n) => ({ id: n.id, p: n.pitch, t: r2(n.start_time), d: r2(n.duration) })) });
+      if (!victims.length) return text('Nincs a feltételnek megfelelő hang.');
+      await bridge.send('edit_notes', { address: a.cim, action: 'remove', ids: victims.map((n) => n.id) });
+      pushUndo(`midi_hangok torol ${a.cim}`, [{ type: 'notes_add', address: a.cim, notes: victims.map(strip) }]);
+      return text({ kesz: true, torolve: victims.length, visszavonas: 'visszavon' });
+    }
+    if (a.muvelet === 'masol') {
+      if (!a.cel_cim) throw new Error('Add meg a cel_cim-et.');
+      const picked = all.filter(inRange).map((n) => ({ ...strip(n), start_time: n.start_time - (a.tol_negyed ?? 0) + (a.eltolas_negyed ?? 0) }));
+      const bad = picked.filter((n) => n.start_time < 0);
+      if (bad.length) throw new Error(`${bad.length} hang negatív kezdetű lenne – igazítsd az eltolas_negyed-et.`);
+      if (!a.vegrehajt) return text({ elonezet: true, masolna: picked.length, cel: a.cel_cim, peldak: picked.slice(0, 8).map((n) => ({ p: n.pitch, t: r2(n.start_time), d: r2(n.duration) })), megjegyzes: 'A cél kezdete = eredeti kezdet − tol_negyed + eltolas_negyed.' });
+      if (!picked.length) return text('Nincs a tartományban hang.');
+      const r = await bridge.send('write_notes', { address: a.cel_cim, notes: picked });
+      pushUndo(`midi_hangok masol ${a.cim} -> ${a.cel_cim}`, [{ type: 'notes_remove', address: a.cel_cim, ids: r.ids }]);
+      return text({ kesz: true, masolva: r.written, visszavonas: 'visszavon' });
+    }
+    throw new Error('Ismeretlen művelet.');
   });
 
 // ---------- MCP protokoll ----------

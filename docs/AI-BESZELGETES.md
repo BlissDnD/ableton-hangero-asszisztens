@@ -17,6 +17,8 @@ A `src/mcp.js` MCP-szervert indít, amin keresztül az AI (Claude Desktop vagy C
 | `arrangement` | ütem-blokkonként ki szól; sávonkénti klip-szakaszok | nem |
 | `midi_olvas` | hangok, ritmusrács-pontosság, elcsúszott hangok, átfedések | nem |
 | `midi_javit` | kvantálás, eltolás, transzponálás, velocity; alapból **előnézet** | csak `vegrehajt:true`-val |
+| `klip_muvelet` | idővonal MIDI-klip másolása, áthelyezése, törlése, némítása (ütemben megadva); foglalt helyre nem ír | előnézet, `vegrehajt:true`-val ír |
+| `midi_hangok` | hangok hozzáadása, törlése, másolása klipek között | előnézet, `vegrehajt:true`-val ír |
 | `hangero_allit` | hangerő (dB), pan, mute, solo; automatizáltat nem ír át | igen (visszavonható) |
 | `visszavon` | az utolsó módosítások visszacsinálása | igen |
 | `lejatszas` | indítás adott ütemtől, leállítás | nem |
@@ -24,4 +26,4 @@ A `src/mcp.js` MCP-szervert indít, amin keresztül az AI (Claude Desktop vagy C
 | `meres` | LUFS / true peak (ideiglenes sávot hoz létre és töröl) | ideiglenesen |
 
 ## Biztonság
-Minden módosítás a `~/.hangero-asszisztens/undo.json`-ba kerül (utolsó 50). Az automatizált paraméterek védettek. Nagy hangerőugrás megerősítést kér. Az idővonal klipjeinek létrehozása/mozgatása/vágása a Live API-n át **nem** lehetséges, ezt az AI javaslatként adja, kézzel kell megcsinálni.
+Minden módosítás a `~/.hangero-asszisztens/undo.json`-ba kerül (utolsó 50). Az automatizált paraméterek védettek. Nagy hangerőugrás megerősítést kér. Idővonal-klipet az API csak MIDI-nél tud másolni/mozgatni (átmeneti Session-klipen át, ehhez kell egy üres Session-slot a sávon); audio-klipet nem. A klipek átméretezése/vágása nem lehetséges. Foglalt helyre alapból nem másol. Élő Live 12.1-en kipróbálva: másolás, hang hozzáadása, klip törlése és visszaállítása, visszavonás.
