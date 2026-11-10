@@ -81,7 +81,7 @@ export async function runCheck(bridge) {
     const song = await bridge.send('get_properties', { address: 'song', names: ['name', 'tempo', 'signature_numerator', 'signature_denominator', 'is_playing', 'record_mode', 'exclusive_arm'] });
     const p = song.properties;
     result.song = p;
-    add(checks, 'info', 'Projekt', `Név: ${p.name || '(nincs elmentve)'}; tempó: ${p.tempo}; ütemmutató: ${p.signature_numerator}/${p.signature_denominator}; lejátszás: ${p.is_playing ? 'fut' : 'áll'}.`);
+    add(checks, 'info', 'Projekt', `Név: ${p.name || '(nincs elmentve)'}; tempó: ${Math.round(p.tempo * 100) / 100}; ütemmutató: ${p.signature_numerator}/${p.signature_denominator}; lejátszás: ${p.is_playing ? 'fut' : 'áll'}.`);
     if (p.record_mode) add(checks, 'figyelmeztetés', 'Felvétel', 'Az Arrangement felvétel gomb be van kapcsolva. A mérés előtt kapcsold ki.');
     if (p.exclusive_arm) add(checks, 'info', 'Exkluzív arm', 'Az "exclusive arm" be van kapcsolva: a mérés az ideiglenes sáv felvételre állításakor átmenetileg kikapcsolhat más sávokat. Az eszköz ezt visszaállítja.');
   } catch (error) {
