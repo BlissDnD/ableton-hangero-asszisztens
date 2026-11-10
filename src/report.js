@@ -28,7 +28,7 @@ function hidePaths(measurement, includePath) {
 
 export function buildReport({ session, summary, check, measurement = null, sideEffects = [], includePath = false, rawFile = null }) {
   const untested = [
-    'Az eszköz valódi Ableton Live 12.1-gyel még nem lett kipróbálva; a fejlesztés szimulált (mock) Live-bridge ellen futott.',
+    'A csak olvasó megfigyelés (vizsgal) egy élő Live 12.1 futáson működött; a hangmérés (meres) és az automatizálás-részletek még nem lett kipróbálva élőben.',
     'A felhasznált Remote Script (AbletonMCP 3.0.0) dokumentáltan Live 12.4-en fejlesztett; a 12.1-es működés nem igazolt.'
   ];
   if (measurement) untested.push('A belső felvétel (Resampling) és a fájlbeolvasás élő Live-ban nem igazolt; az eredményt vesd össze egy ellenőrző exporttal (lásd docs/TESZT-UTMUTATO.md).');
@@ -56,7 +56,7 @@ export function renderMarkdown(report) {
   const L = [];
   L.push(`# Hangerő-vizsgálat: ${report.project.name}`);
   L.push('', `*Készült: ${report.created_at} · ${report.tool.name} ${report.tool.version}*`, '');
-  L.push('> **Fontos:** ez az eszköz élő Ableton 12.1-gyel még nem lett kipróbálva. A mérőértékek a Live saját, nem kalibrált skáláján vannak, kivéve a "Hangmérés" szakaszt.', '');
+  L.push('> **Fontos:** a csak olvasó megfigyelés élő Ableton 12.1-en egy futásban működött, a hangmérés még nem lett kipróbálva élőben. A mérőértékek a Live saját, nem kalibrált skáláján vannak, kivéve a "Hangmérés" szakaszt.', '');
   L.push('## Mit vizsgáltunk', '');
   L.push(`- **Projekt:** ${report.project.name}${report.project.file_path ? ` (${report.project.file_path})` : ''}`);
   L.push(`- **Live:** ${report.live ? `${report.live.version ?? '?'} (${report.live.variant ?? '?'})` : 'nem ismert'}`);

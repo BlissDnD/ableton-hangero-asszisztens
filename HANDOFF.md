@@ -71,3 +71,11 @@ Parancsok: `node --test` (tesztek), `npm run szimulator` (mock a 9877-en, Ableto
 - A `git push` néha „push negotiation failed" figyelmeztetést ír, de lefut; mindig ellenőrizd `git fetch` + `rev-parse`-szal.
 - A `musicassistant` repó a felhasználó másik projektje (Song Architect Studio), **ne nyúlj hozzá**.
 - Commitokba a gép által megadott szerzőjelölés kerül; a jelentés/kód nem tartalmaz személyes adatot.
+
+## 8. Élő próba eredménye (2026-11-10, Live 12.1)
+- `vizsgal`: élőben OK (97 minta, 0 hiba, a projekt nem változott).
+- `meres`: élőben lefutott (sáv létrehozás, Resampling felvétel, WAV, törlés, arm visszaállítás). 25–32. ütem: −17,45 LUFS, −4,91 dBTP.
+- Kézi exporthoz (Master, 32 bit WAV) hasonlítva, hangra igazított szeletre: −17,50 LUFS (eltérés 0,05 LU, a küszöb 0,5), de a csúcs −3,99 vs −4,93 dBFS (kb. 0,9 dB, mintacsúcs is eltér). Az igazítás korrelációja csak 0,75: a kettő nem teljesen azonos tartalom (az export korábbi projektállapotból, vagy nem determinisztikus hangszerek). A true peak egyezése ezért **nem igazolt**; ismételt, azonos állapotú próba kell.
+- Hiba javítva: a mérés saját ideiglenes sávja bekerült a `vizsgal` sávlistába (`observe.js` kiszűri).
+- Megfigyelés: a `meres` 31,4 negyedet vett fel a kért 32 helyett; a `start_playback` + `current_song_time` beállítás futás közben működik, megállított állapotban a pozíció nem ugrik.
+- Ismételhetőség: ugyanazon rész második `meres`-e −17,43 LUFS / −5,51 dBTP (az első −17,45 / −4,91). A LUFS ±0,02 LU-n belül stabil, a csúcs futásról futásra ~0,6 dB-t ingadozik (nem determinisztikus hangszerek/effektek, vagy kezdőpont-csúszás), tehát az export −3,99 dBFS csúcsa a zajon belül van. **Következtetés:** a LUFS-mérés élőben igazolt (0,05–0,07 LU eltérés a kézi exporttól); a true peak egyezése pontosan nem ellenőrizhető ilyen anyagon, a csúcsot nem szabad 1 dB-nél finomabbra venni. T5: LUFS ✅, true peak ⚠️ (zajhatár).

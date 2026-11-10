@@ -135,6 +135,7 @@ export async function observe(bridge, o = {}) {
 
     const tracks = {};
     for (const row of snapshot.tracks) {
+      if (row.name === 'HANGERO MERES') continue; // a mérés ideiglenes sávja (SCRATCH_NAME, measure.js) nem része a projektnek
       tracks[row.address] = [
         row.meter?.left ?? 0, row.meter?.right ?? 0, row.fader ?? null,
         row.mute ? 1 : 0, row.silenced_by_solo ? 1 : 0, row.solo ? 1 : 0
